@@ -1,3 +1,5 @@
+> [Binder 总览](http://gityuan.com/2015/10/31/binder-prepare/)
+> [谈谈你对 Binder 的理解](https://zhuanlan.zhihu.com/p/152237289)
 # Binder是什么
 - 进程间通信；
 - 虚拟的物理驱动(没有硬件)；
@@ -7,7 +9,120 @@
 - 性能：mmap 单次拷贝；
 - 安全性：进程 pid 等信息、CS 架构；
 
-# Binder 的启动
+# Binder Native 层的启动
+ProcessState.open_driver()：ProcessState 是单例模式，保证进程一个Binder
+
+1. init 创建 "dev/binder" 节点；
+2. open 获取 Binder 描述符fd（一切皆文件的描述符）；
+   ioctr 使用命令沟通 binder 驱动，设置 Binder 线程容量
+3. mmap 内存映射；
+   首先在内核创建一块与用户空间大小一致的虚拟内存，然后再申请1个page大小的物理内存(4kb 使用时扩容)，之后分别映射到用户和内核虚拟内存。实现内核空间的 Buffer 和用户空间 Buffer 同步操作的功能。
+4. ioctr 传递参数给 Binder 驱动。
+   ioctr(描述符，ioctr命令，数据类型) 作为驱动需要命令驱使，读写数据的过程需要持有同步锁；
+   **binder_ioctl_write_read()**：也就是 copy_from_user和copy_to_user 的过程，缓存中存在数据则进行相应的读写操作。
+
+> 四个方法都是通过用户层调用 syscall 执行到内核层的方法。
+> system_server 进程 open、mmap 之后 ioctr 设置为 Binder 管家，之后 loop 等待操作；
+> 普通进程 open、mmap 之后添加服务到 system_server。
+
+# Binder 传输数据过程
+
+![整体通信过程](https://upload-images.jianshu.io/upload_images/6762021-482408d7233832fc.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+
+- **BC_XXX**: BINDER_COMMAND_PROTOCOL，IPC 发往 Binder 用于执行命令，生成 binder_work；
+- **BR_XXX**：Binder 响应码，用于 Binder 到 IPC 层。
+  
+Binder 通信至少是两个进程的交互：
+- Client 进程执行 binder_thread_write 写入命令和数据，生成 binder_work:
+- Server 进程执行 binder_thread_read  生成 BR_XXX 发送到用户空间处理。
+
+![通信](https://upload-images.jianshu.io/upload_images/6762021-1b828ea63d47eb8d.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+
+# 注册服务过程 其实也是一次 IPC 过程
+普通进程启动之后，通过 open/mmap 等之后，获取 defaultServiceManger.addService （BpServiceManager），如果此时 ServiceManager 没有创建，会执行创建。
+
+注册的什么东西？ 服务名+对象（例如 "media.player" 和 MediaPlayerService）
+注册的过程是由 Parcel 打包的数据，通过 write 写入。
+![IPC过程](https://upload-images.jianshu.io/upload_images/6762021-70f6d44b4d62a17a.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+
+注册服务过程
+1. MeadiaService 进程调用 ioctr 向 Binder 驱动发消息，消息里是 Parcel 打包的 handle（目标进程）、服务名、MeadiaService 对象；
+2. Binder 驱动收到消息后，生成 BR_TRANSACTION 命令，找到执行该命令的线程（handle == 0 ServiceManager），把事项加入到该线程的 todo 队列；
+3. ServiceManager 处理完注册以后，生成 BC_REPLY 应答命令给 Binder 驱动
+4. Binder 收到以后生成 BR_REPLY 到 MeadiaService 进程，说明可以正常工作。
+
+
+# Binder 线程池
+
+Binder 设计中，只有第一个Binder主线程(也就是Binder_1线程)是主动创建的，Binder 线程池的普通线程都是根据需要创建并加入线程池。
+Binder 线程池默认数量 15；
+当发生 IPC 时，执行 binder_thread_read 时发现没有可用线程且线程数量没有达到上限，则创建线程。
+
+
+
+# ServiceManager 的启动
+
+要使用系统 Binder，需要从 ServiceManager 获取。在这之前，ServiceManager 需要启动。
+> service_manager.c
+```
+int main{
+    bs = binder_open(128*1024); // ->open("dev_binder")
+    bs->mapped = mmap(...); // 驱动和sm的区域做映射
+    binder_become_context_manager(bs); // 设置SM为管家->ioctl(BINDER_SET_CONTEXT_MGR)
+    binder_loop(); // 循环监听
+}
+```
+
+1. **binder_open**：打开驱动（默认分配内存 128K），内存映射；
+2. **binder_become_context_manager**：设置 SM 为 Binder 管家；
+```
+int binder_become_context_manager(struct binder_state *bs)
+{
+    //通过ioctl，传递BINDER_SET_CONTEXT_MGR指令 --> 该指令最终调用 binder_ioctl_set_ctx_mgr
+    return ioctl(bs->fd, BINDER_SET_CONTEXT_MGR, 0);
+}
+```
+3. **bind_loop** 轮询处理，准备完成，等待Client事件；**数据传输的过程主要还是 copy_from_user，write_size > 0 执行 binder_write、read_size > 0 执行 binder_read。**
+    1. 执行 BC_ENTER_LOOP 命令，调用 **binder_ioctr_write_read；** *注释1
+    2. 当 write_size > 0 -> binder_thread_write、read 同理；
+    3. binder_thread_write、read 会 switch 命令进行处理，BC_ENTER_LOOP 命令设置 looper 状态为循环；
+
+# ServiceManager 的获取
+
+当需要从 ServiceManager 添加和获取服务时，需要获取 gDefaultServiceManager(Native)，是个单例。
+```
+sp<IServiceManager> defaultServiceManager()
+{
+    if (gDefaultServiceManager != NULL) return gDefaultServiceManager;
+    {
+        AutoMutex _l(gDefaultServiceManagerLock); //加锁
+        while (gDefaultServiceManager == NULL) {
+            gDefaultServiceManager = interface_cast<IServiceManager>(
+                ProcessState::self()->getContextObject(NULL));
+            if (gDefaultServiceManager == NULL)
+                sleep(1);
+        }
+    }
+    return gDefaultServiceManager;
+}
+```
+1. **ProcessState::self():** 创建 ProcessState，重要参数和函数：
+   open_driver：启动 Binder 驱动，返回 binder fd（文件操作符）
+   **BINDER_VM_SIZE** 1M-8k 页缓存*2，设置Binder数据容量；
+   mDriverFD：记录 binder 的 fd，用于调用驱动。
+2. **getContextObject(NULL):**获取 BpBinder 对象：new BpBinder()；
+3. IServiceManager::asInterface == new BpServiceManager(new BpBinder)
+   BpServiceManager，
+
+
+
+
+
+
+
+
+
+
 
 ![Binder启动](https://upload-images.jianshu.io/upload_images/6762021-e1dd501eb6e33d13.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
 
@@ -104,21 +219,6 @@ struct binder_write_read {
     4. mRemote.transact == BpBinder.transact
 
 
-
-### SM 服务添加过程
-
-> ServiceManager.java -> getIServiceManager().addService(name, service, flase)
-
-- getIServiceManager --- new ServiceManagerProxy(new BinderProxy())
-    - ServiceManagerNative.asInterface(BinderInternal.getContextObject())
-        - BinderInternal.getContextObject -- 返回 BinderProxy 对象
-          - ProcessState::self() -> getContextObject: 创建 BpBinder
-          - javaObjectForIBinder -- BinderProxy和BpBinder 互相绑定
-        - ServiceManagerNatice.asInterface
-          - 返回 ServiceManagerProxy
-- addService
-  - data.writeStrongBinder(service); -- service==AMS  将 AMS 放入 data 中
-    
 
 
 
