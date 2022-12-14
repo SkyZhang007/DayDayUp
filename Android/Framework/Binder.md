@@ -1,5 +1,6 @@
 > [Binder 总览](http://gityuan.com/2015/10/31/binder-prepare/)
 > [谈谈你对 Binder 的理解](https://zhuanlan.zhihu.com/p/152237289)
+> [Binder](https://mp.weixin.qq.com/s?__biz=MzIzOTkwMDY5Nw==&mid=2247483707&idx=1&sn=e797e0d67bc4e3b8ef78ef5a64adbac9&chksm=e922404dde55c95b357f3da9ca3473534390ad7feae7acb5d07615f2237ecdd048f73de6c205&scene=178&cur_album_id=1343624103303102464#rd)
 # Binder是什么
 - 进程间通信；
 - 虚拟的物理驱动(没有硬件)；
